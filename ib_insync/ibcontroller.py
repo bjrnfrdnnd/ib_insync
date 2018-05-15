@@ -17,16 +17,16 @@ class IBC(Object):
     """
     Programmatic control over starting and stopping TWS/Gateway
     using IBC (https://github.com/IbcAlpha/IBC).
-    
+
     Arguments:
-    
+
     * ``twsVersion`` (required): The major version number for TWS or gateway.
     * ``tradingMode``: 'live' or 'paper'.
     * ``userid``: IB account username. It is recommended to set the real
       username/password in a secured IBC config file.
     * ``password``: IB account password.
     * ``twsPath``: Path to the TWS installation folder.
-    
+
       =======  ==============
       Default
       =======================
@@ -34,9 +34,9 @@ class IBC(Object):
       OS X     ~/Applications
       Windows  C:\\\\Jts
       =======  ==============
-      
+
     * ``twsSettingsPath``: Path to the TWS settings folder.
-    
+
       ========  =============
       Default
       =======================
@@ -44,44 +44,44 @@ class IBC(Object):
       OS X      ~/Jts
       Windows   Not available
       ========  =============
-      
+
     * ``ibcPath``: Path to the IBC installation folder.
-    
+
       ========  =============
       Default
       =======================
-      Linux     /opt/ibc
-      OS X      /opt/ibc
-      Windows   C:\\\\IBC
+      Linux     /opt/IBController
+      OS X      /opt/IBController
+      Windows   C:\\\\IBController
       ========  =============
-      
+
     * ``ibcIni``: Path to the IBC configuration file.
-    
+
       ========  =============
       Default
       =======================
-      Linux     ~/ibc/config.ini
-      OS X      ~/ibc/config.ini
-      Windows   %%HOMEPATH%%\\\\Documents\\\\IBC\\\\config.ini
+      Linux     ~/IBController/config.ini
+      OS X      ~/IBController/config.ini
+      Windows   %%HOMEPATH%%\\\\Documents\\\\IBController\\\\config.ini
       ========  =============
-      
+
     * ``javaPath``: Path to Java executable.
       Default is to use the Java VM included with TWS/gateway.
     * ``fixuserid``: FIX account user id (gateway only).
     * ``fixpassword``: FIX account password (gateway only).
-    
+
     To use IBC on Windows, the the proactor (or quamash) event loop
     must have been set:
-    
+
     .. code-block:: python
-        
+
         import asyncio
         asyncio.set_event_loop(asyncio.ProactorEventLoop())
-    
+
     Example usage:
-    
+
     .. code-block:: python
-    
+
         ibc = IBC(969, gateway=True, tradingMode='live',
                 userid='edemo', password='demouser')
         ibc.start()
@@ -111,8 +111,8 @@ class IBC(Object):
     def __init__(self, *args, **kwargs):
         Object.__init__(self, *args, **kwargs)
         if not self.ibcPath:
-            self.ibcPath = '/opt/ibc' if os.sys.platform != 'win32' \
-                    else 'C:\\IBC'
+            self.ibcPath = '/opt/IBController' if os.sys.platform != 'win32' \
+                    else 'C:\\IBController'
         self._proc = None
         self._monitor = None
         self._logger = logging.getLogger('ib_insync.IBC')
@@ -143,8 +143,9 @@ class IBC(Object):
 
         # create shell command
         win32 = os.sys.platform == 'win32'
-        cmd = [f'{self.ibcPath}\\scripts\\StartIBC.bat' if win32 else
-            f'{self.ibcPath}/scripts/ibcstart.sh']
+        ibControllerStartStr = 'IBController'
+        cmd = [f'{self.ibcPath}\\Scripts\\{ibControllerStartStr}.bat' if win32 else
+            f'{self.ibcPath}/Scripts/{ibControllerStartStr}.sh']
         for k, v in self.dict().items():
             arg = IBC._Args[k][2 if win32 else 1]
             if v:
@@ -182,14 +183,14 @@ class IBC(Object):
 class IBController(Object):
     """
     For new installations it is recommended to use IBC instead.
-    
+
     Programmatic control over starting and stopping TWS/Gateway
     using IBController (https://github.com/ib-controller/ib-controller).
-    
+
     On Windows the the proactor (or quamash) event loop must have been set:
-    
+
     .. code-block:: python
-        
+
         import asyncio
         asyncio.set_event_loop(asyncio.ProactorEventLoop())
 
@@ -304,15 +305,15 @@ class Watchdog(Object):
     """
     Start, connect and watch over the TWS or gateway app to keep it running
     in the face of crashes, freezes and network outages.
-    
+
     The idea is to wait until there is no traffic coming from the app for
     a certain amount of time (the ``appTimeout`` parameter). This triggers
     a historical request to be placed just to see if the app is still alive
     and well. If yes, then continue, if no then restart the whole app
     and reconnect. Restarting will also occur directly on error 1100.
-    
+
     Arguments:
-    
+
     * ``controller`` (required): IBC or IBController instance;
     * ``ib`` (required): IB instance to be used. Do no connect this
       instance as Watchdog takes care of that.
@@ -323,13 +324,13 @@ class Watchdog(Object):
     * ``appTimeout``: Timeout (in seconds) for network traffic idle time;
     * ``retryDelay``: Time (in seconds) to restart app after a previous failure;
       If left empty then Watchdog creates the IB instance.
-    
+
     Note: ``util.patchAsyncio()`` must have been called before.
-    
+
     Example usage:
-    
+
     .. code-block:: python
-    
+
         util.patchAsyncio()
 
         ibc = IBC(969, gateway=True, tradingMode='paper')
@@ -338,7 +339,7 @@ class Watchdog(Object):
         app.start()
         print(app.ib.accountValues())
         IB.run()
-    
+
     Events:
         * ``startingEvent(watchdog)``
         * ``startedEvent(watchdog)``
