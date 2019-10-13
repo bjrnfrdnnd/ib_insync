@@ -2,39 +2,41 @@ import asyncio
 import logging
 import datetime
 from collections import defaultdict
-
-from ibapi.wrapper import EWrapper, iswrapper
-from ibapi.common import UNSET_DOUBLE
+from contextlib import suppress
 
 from ib_insync.contract import Contract
 from ib_insync.ticker import Ticker
 from ib_insync.order import Order, OrderStatus, Trade
-from ib_insync.objects import *
+from ib_insync.objects import (
+    AccountValue, PortfolioItem, Position, TradeLogEntry, PriceIncrement,
+    OptionChain, Fill, CommissionReport, RealTimeBar, Dividends,
+    NewsTick, NewsArticle, NewsBulletin, NewsProvider, HistoricalNews,
+    TickData, HistoricalTick, HistoricalTickBidAsk, HistoricalTickLast,
+    TickByTickAllLast, TickByTickBidAsk, TickByTickMidPoint, FundamentalRatios,
+    MktDepthData, DOMLevel, OptionComputation, ScanData, HistogramData)
 import ib_insync.util as util
+from .util import UNSET_DOUBLE, UNSET_INTEGER
 
 __all__ = ['Wrapper']
 
 
-class Wrapper(EWrapper):
+class Wrapper:
     """
     Wrapper implementation for use with the IB class.
     """
-
     def __init__(self, ib):
-        self.updateEv = asyncio.Event()
-        self.timeoutEv = asyncio.Event()
-        self._ib = ib
-        self._callbacks = {}  # eventName -> callback
+        self.ib = ib
         self._logger = logging.getLogger('ib_insync.wrapper')
         self._timeoutHandle = None
         self.reset()
 
     def reset(self):
-        self.accountValues = {}  # (account, tag, currency, modelCode) -> AccountValue
+        self.accountValues = {}  # (acc, tag, curr, modelCode) -> AccountValue
         self.acctSummary = {}  # (account, tag, currency) -> AccountValue
         self.portfolio = defaultdict(dict)  # account -> conId -> PortfolioItem
         self.positions = defaultdict(dict)  # account -> conId -> Position
-        self.trades = {}  # (client, orderId) or permidId -> Trade
+        self.trades = {}  # (client, orderId) or permId -> Trade
+        self.permId2Trade = {}  # permId -> Trade
         self.fills = {}  # execId -> Fill
         self.newsTicks = []  # list of NewsTick
         self.newsBulletins = {}  # msgId -> NewsBulletin
@@ -44,7 +46,7 @@ class Wrapper(EWrapper):
         self.reqId2Ticker = {}
         self.ticker2ReqId = defaultdict(dict)  # tickType -> Ticker -> reqId
 
-        self.reqId2Bars = {}  # realtime bars + keepUpToDate historical bars
+        self.reqId2Subscriber = {}  # live subscribers (live bars, scan data)
 
         self.pnls = {}  # reqId -> PnL
         self.pnlSingles = {}  # reqId -> PnLSingle
@@ -58,11 +60,20 @@ class Wrapper(EWrapper):
         self.accounts = []
         self.clientId = -1
         self.lastTime = None  # datetime (UTC) of last network packet arrival
-        self.autoclearTickers = True
         self._timeout = 0
-        if self._timeoutHandle:
-            self._timeoutHandle.cancel()
-            self._timeoutHandle = None
+        self.setTimeout(0)
+
+    def connectionClosed(self):
+        for ticker in self.tickers.values():
+            ticker.updateEvent.set_done()
+        for sub in self.reqId2Subscriber.values():
+            sub.updateEvent.set_done()
+        error = ConnectionError('Socket disconnect')
+        for future in self._futures.values():
+            if not future.done():
+                future.set_exception(error)
+        util.globalErrorEvent.emit(error)
+        self.reset()
 
     def startReq(self, key, contract=None, container=None):
         """
@@ -99,8 +110,9 @@ class Wrapper(EWrapper):
         """
         ticker = self.tickers.get(id(contract))
         if not ticker:
-            ticker = Ticker(contract=contract, ticks=[], tickByTicks=[],
-                    domBids=[], domAsks=[], domTicks=[])
+            ticker = Ticker(
+                contract=contract, ticks=[], tickByTicks=[],
+                domBids=[], domAsks=[], domTicks=[])
             self.tickers[id(contract)] = ticker
         self.reqId2Ticker[reqId] = ticker
         self._reqId2Contract[reqId] = contract
@@ -112,13 +124,19 @@ class Wrapper(EWrapper):
         self._reqId2Contract.pop(reqId, None)
         return reqId
 
-    def startBars(self, reqId, contract, bars):
+    def startSubscription(self, reqId, subscriber, contract=None):
+        """
+        Register a live subscription.
+        """
         self._reqId2Contract[reqId] = contract
-        self.reqId2Bars[reqId] = bars
+        self.reqId2Subscriber[reqId] = subscriber
 
-    def endBars(self, bars):
-        self._reqId2Contract.pop(bars.reqId, None)
-        self.reqId2Bars.pop(bars.reqId, None)
+    def endSubscription(self, subscriber):
+        """
+        Unregister a live subscription.
+        """
+        self._reqId2Contract.pop(subscriber.reqId, None)
+        self.reqId2Subscriber.pop(subscriber.reqId, None)
 
     def orderKey(self, clientId, orderId, permId):
         if orderId <= 0:
@@ -128,28 +146,11 @@ class Wrapper(EWrapper):
             key = (clientId, orderId)
         return key
 
-    def setCallback(self, eventName, callback):
-        print('setCallback will be depreciated, use events instead')
-        events = [e.replace('Event', '') for e in self._ib.events]
-        if eventName not in events:
-            raise ValueError(f'eventName must be one of {events}')
-        self._callbacks[eventName + 'Event'] = callback
-
-    def handleEvent(self, eventName, *args):
-        # emit event and optional callback
-        event = getattr(self._ib, eventName)
-        cb = self._callbacks.get(eventName)
-        try:
-            event.emit(*args)
-            if cb:
-                cb(*args)
-        except:
-            self._logger.exception('Event %s(%s)', eventName, args)
-
     def setTimeout(self, timeout):
         self.lastTime = datetime.datetime.now(datetime.timezone.utc)
         if self._timeoutHandle:
             self._timeoutHandle.cancel()
+        self._timeoutHandle = None
         self._timeout = timeout
         if timeout:
             self._setTimer(timeout)
@@ -166,98 +167,84 @@ class Wrapper(EWrapper):
             self._timeoutHandle = loop.call_later(delay, self._setTimer)
         else:
             self._logger.debug('Timeout')
-            self.handleEvent('timeoutEvent', diff)
-            self.timeoutEv.set()
-            self.timeoutEv.clear()
-            self._timeout = 0
-            self._timeoutHandle = None
+            self.setTimeout(0)
+            self.ib.timeoutEvent.emit(diff)
 
-    @iswrapper
+    # wrapper methods
+
     def connectAck(self):
         pass
 
-    @iswrapper
     def nextValidId(self, reqId):
         pass
 
-    @iswrapper
     def managedAccounts(self, accountsList):
-        self.accounts = accountsList.split(',')
+        self.accounts = [a for a in accountsList.split(',') if a]
 
-    @iswrapper
     def updateAccountTime(self, timestamp):
         pass
 
-    @iswrapper
     def updateAccountValue(self, tag, val, currency, account):
         key = (account, tag, currency, '')
         acctVal = AccountValue(account, tag, val, currency, '')
         self.accountValues[key] = acctVal
-        self.handleEvent('accountValueEvent', acctVal)
+        self.ib.accountValueEvent.emit(acctVal)
 
-    @iswrapper
     def accountDownloadEnd(self, _account):
         # sent after updateAccountValue and updatePortfolio both finished
         self._endReq('accountValues')
 
-    @iswrapper
-    def accountUpdateMulti(self, reqId, account, modelCode, tag,
-            val, currency):
+    def accountUpdateMulti(
+            self, reqId, account, modelCode, tag, val, currency):
         key = (account, tag, currency, modelCode)
         acctVal = AccountValue(account, tag, val, currency, modelCode)
         self.accountValues[key] = acctVal
-        self.handleEvent('accountValueEvent', acctVal)
-    
-    @iswrapper
+        self.ib.accountValueEvent.emit(acctVal)
+
     def accountUpdateMultiEnd(self, reqId):
         self._endReq(reqId)
 
-    @iswrapper
     def accountSummary(self, _reqId, account, tag, value, currency):
         key = (account, tag, currency)
         acctVal = AccountValue(account, tag, value, currency, '')
         self.acctSummary[key] = acctVal
-        self.handleEvent('accountSummaryEvent', acctVal)
+        self.ib.accountSummaryEvent.emit(acctVal)
 
-    @iswrapper
     def accountSummaryEnd(self, reqId):
         self._endReq(reqId)
 
-    @iswrapper
-    def updatePortfolio(self, contract, posSize, marketPrice, marketValue,
+    def updatePortfolio(
+            self, contract, posSize, marketPrice, marketValue,
             averageCost, unrealizedPNL, realizedPNL, account):
-        contract = Contract(**contract.__dict__)
+        contract = Contract.create(**contract.dict())
         portfItem = PortfolioItem(
-                contract, posSize, marketPrice, marketValue,
-                averageCost, unrealizedPNL, realizedPNL, account)
+            contract, posSize, marketPrice, marketValue,
+            averageCost, unrealizedPNL, realizedPNL, account)
         portfolioItems = self.portfolio[account]
         if posSize == 0:
             portfolioItems.pop(contract.conId, None)
         else:
             portfolioItems[contract.conId] = portfItem
-        self.handleEvent('updatePortfolioEvent', portfItem)
         self._logger.info(f'updatePortfolio: {portfItem}')
+        self.ib.updatePortfolioEvent.emit(portfItem)
 
-    @iswrapper
     def position(self, account, contract, posSize, avgCost):
-        contract = Contract(**contract.__dict__)
+        contract = Contract.create(**contract.dict())
         position = Position(account, contract, posSize, avgCost)
         positions = self.positions[account]
         if posSize == 0:
             positions.pop(contract.conId, None)
         else:
             positions[contract.conId] = position
-        self.handleEvent('positionEvent', position)
         self._logger.info(f'position: {position}')
         results = self._results.get('positions')
         if results is not None:
             results.append(position)
+        self.ib.positionEvent.emit(position)
 
-    @iswrapper
     def positionEnd(self):
         self._endReq('positions')
 
-    @iswrapper
     def pnl(self, reqId, dailyPnL, unrealizedPnL, realizedPnL):
         pnl = self.pnls.get(reqId)
         if not pnl:
@@ -265,11 +252,10 @@ class Wrapper(EWrapper):
         pnl.dailyPnL = dailyPnL
         pnl.unrealizedPnL = unrealizedPnL
         pnl.realizedPnL = realizedPnL
-        self.handleEvent('pnlEvent', pnl)
+        self.ib.pnlEvent.emit(pnl)
 
-    @iswrapper
-    def pnlSingle(self, reqId, pos, dailyPnL,
-            unrealizedPnL, realizedPnL, value):
+    def pnlSingle(
+            self, reqId, pos, dailyPnL, unrealizedPnL, realizedPnL, value):
         pnlSingle = self.pnlSingles.get(reqId)
         if not pnlSingle:
             return
@@ -278,68 +264,80 @@ class Wrapper(EWrapper):
         pnlSingle.unrealizedPnL = unrealizedPnL
         pnlSingle.realizedPnL = realizedPnL
         pnlSingle.value = value
-        self.handleEvent('pnlSingleEvent', pnlSingle)
+        self.ib.pnlSingleEvent.emit(pnlSingle)
 
-    @iswrapper
     def openOrder(self, orderId, contract, order, orderState):
         """
         This wrapper is called to:
+
         * feed in open orders at startup;
         * feed in open orders or order updates from other clients and TWS
-        if clientId=master id;
-        * feed in manual orders and order updates from TWS if clientId=0.
+          if clientId=master id;
+        * feed in manual orders and order updates from TWS if clientId=0;
+        * handle openOrders and allOpenOrders responses.
         """
         if order.whatIf:
             # response to whatIfOrder
-            orderState = OrderState(**orderState.__dict__)
             self._endReq(order.orderId, orderState)
         else:
-            if order.softDollarTier:
-                order.softDollarTier = SoftDollarTier(
-                        **order.softDollarTier.__dict__)
             key = self.orderKey(order.clientId, order.orderId, order.permId)
             trade = self.trades.get(key)
+            # ignore '?' values in the order
+            d = {k: v for k, v in order.dict().items() if v != '?'}
             if trade:
-                trade.order.update(**order.__dict__)
+                trade.order.update(**d)
             else:
-                contract = Contract(**contract.__dict__)
-                order = Order(**order.__dict__)
+                contract = Contract.create(**contract.dict())
+                order = Order(**d)
                 orderStatus = OrderStatus(status=orderState.status)
                 trade = Trade(contract, order, orderStatus, [], [])
                 self.trades[key] = trade
                 self._logger.info(f'openOrder: {trade}')
+            self.permId2Trade.setdefault(order.permId, trade)
             results = self._results.get('openOrders')
             if results is None:
-                self.handleEvent('openOrderEvent', trade)
+                self.ib.openOrderEvent.emit(trade)
             else:
-                # response to reqOpenOrders
+                # response to reqOpenOrders or reqAllOpenOrders
                 results.append(order)
 
-    @iswrapper
     def openOrderEnd(self):
         self._endReq('openOrders')
 
-    @iswrapper
-    def orderStatus(self, orderId, status, filled, remaining, avgFillPrice,
+    def completedOrder(self, contract, order, orderState):
+        contract = Contract.create(**contract.dict())
+        orderStatus = OrderStatus(status=orderState.status)
+        trade = Trade(contract, order, orderStatus, [], [])
+        self._results['completedOrders'].append(trade)
+        if order.permId not in self.permId2Trade:
+            self.trades[order.permId] = trade
+            self.permId2Trade[order.permId] = trade
+
+    def completedOrdersEnd(self):
+        self._endReq('completedOrders')
+
+    def orderStatus(
+            self, orderId, status, filled, remaining, avgFillPrice,
             permId, parentId, lastFillPrice, clientId, whyHeld,
             mktCapPrice=0.0, lastLiquidity=0):
         key = self.orderKey(clientId, orderId, permId)
         trade = self.trades.get(key)
         if trade:
             oldStatus = trade.orderStatus.status
-            new = dict(status=status, filled=filled,
-                    remaining=remaining, avgFillPrice=avgFillPrice,
-                    permId=permId, parentId=parentId,
-                    lastFillPrice=lastFillPrice, clientId=clientId,
-                    whyHeld=whyHeld, mktCapPrice=mktCapPrice,
-                    lastLiquidity=lastLiquidity)
+            new = dict(
+                status=status, filled=filled,
+                remaining=remaining, avgFillPrice=avgFillPrice,
+                permId=permId, parentId=parentId,
+                lastFillPrice=lastFillPrice, clientId=clientId,
+                whyHeld=whyHeld, mktCapPrice=mktCapPrice,
+                lastLiquidity=lastLiquidity)
             curr = trade.orderStatus.dict()
             isChanged = curr != {**curr, **new}
             if isChanged:
                 trade.orderStatus.update(**new)
                 msg = ''
-            elif (status == 'Submitted' and trade.log and
-                    trade.log[-1].message == 'Modify'):
+            elif (status == 'Submitted' and trade.log
+                    and trade.log[-1].message == 'Modify'):
                 # order modifications are acknowledged
                 msg = 'Modified'
             else:
@@ -349,7 +347,7 @@ class Wrapper(EWrapper):
                 logEntry = TradeLogEntry(self.lastTime, status, msg)
                 trade.log.append(logEntry)
                 self._logger.info(f'orderStatus: {trade}')
-                self.handleEvent('orderStatusEvent', trade)
+                self.ib.orderStatusEvent.emit(trade)
                 trade.statusEvent.emit(trade)
                 if status != oldStatus:
                     if status == OrderStatus.Filled:
@@ -357,119 +355,112 @@ class Wrapper(EWrapper):
                     elif status == OrderStatus.Cancelled:
                         trade.cancelledEvent.emit(trade)
         else:
-            self._logger.error('orderStatus: No order found for '
-                    'orderId %s and clientId %s', orderId, clientId)
+            self._logger.error(
+                'orderStatus: No order found for '
+                'orderId %s and clientId %s', orderId, clientId)
 
-    @iswrapper
     def execDetails(self, reqId, contract, execution):
         """
         This wrapper handles both live fills and responses to reqExecutions.
         """
-        if execution.orderId == 2147483647:
-            # bug in TWS: executions of manual orders have orderId=2**31 - 1
+        self._logger.info(f'execDetails {execution}')
+        if execution.orderId == UNSET_INTEGER:
+            # bug in TWS: executions of manual orders have unset value
             execution.orderId = 0
         key = self.orderKey(
-                execution.clientId, execution.orderId, execution.permId)
-        trade = self.trades.get(key)
-        if trade and contract.conId == trade.contract.conId:
+            execution.clientId, execution.orderId, execution.permId)
+        trade = self.trades.get(key) or self.permId2Trade.get(execution.permId)
+        if trade and contract == trade.contract:
             contract = trade.contract
         else:
-            contract = Contract(**contract.__dict__)
+            contract = Contract.create(**contract.dict())
         execId = execution.execId
-        execution = Execution(**execution.__dict__)
-        fill = Fill(contract, execution, CommissionReport(), self.lastTime)
+        execution.time = util.parseIBDatetime(execution.time). \
+            astimezone(datetime.timezone.utc)
         isLive = reqId not in self._futures
+        time = self.lastTime if isLive else execution.time
+        fill = Fill(contract, execution, CommissionReport(), time)
         if execId not in self.fills:
             # first time we see this execution so add it
             self.fills[execId] = fill
             if trade:
                 trade.fills.append(fill)
-                logEntry = TradeLogEntry(self.lastTime,
-                        trade.orderStatus.status,
-                        f'Fill {execution.shares}@{execution.price}')
+                logEntry = TradeLogEntry(
+                    time,
+                    trade.orderStatus.status,
+                    f'Fill {execution.shares}@{execution.price}')
                 trade.log.append(logEntry)
                 if isLive:
-                    self.handleEvent('execDetailsEvent', trade, fill)
                     self._logger.info(f'execDetails: {fill}')
+                    self.ib.execDetailsEvent.emit(trade, fill)
                     trade.fillEvent(trade, fill)
         if not isLive:
             self._results[reqId].append(fill)
 
-    @iswrapper
     def execDetailsEnd(self, reqId):
         self._endReq(reqId)
 
-    @iswrapper
     def commissionReport(self, commissionReport):
         if commissionReport.yield_ == UNSET_DOUBLE:
             commissionReport.yield_ = 0.0
+        if commissionReport.realizedPNL == UNSET_DOUBLE:
+            commissionReport.realizedPNL = 0.0
         fill = self.fills.get(commissionReport.execId)
         if fill:
             report = fill.commissionReport.update(
-                    **commissionReport.__dict__)
+                **commissionReport.dict())
             self._logger.info(f'commissionReport: {report}')
-            key = self.orderKey(fill.execution.clientId,
-                    fill.execution.orderId, fill.execution.permId)
-            trade = self.trades.get(key)
+            trade = self.permId2Trade.get(fill.execution.permId)
             if trade:
-                self.handleEvent('commissionReportEvent',
-                        trade, fill, report)
+                self.ib.commissionReportEvent.emit(trade, fill, report)
                 trade.commissionReportEvent.emit(trade, fill, report)
             else:
                 # this is not a live execution and the order was filled
                 # before this connection started
                 pass
         else:
-            report = CommissionReport(**commissionReport.__dict__)
-            self._logger.error('commissionReport: '
-                    'No execution found for %s', report)
+            # commission report is not for this client
+            pass
 
-    @iswrapper
+    def orderBound(self, reqId, apiClientId, apiOrderId):
+        pass
+
     def contractDetails(self, reqId, contractDetails):
-        cd = ContractDetails(**contractDetails.__dict__)
-        cd.summary = Contract(**cd.summary.__dict__)
-        if cd.secIdList:
-            cd.secIdList = [TagValue(s.tag, s.value) for s in cd.secIdList]
-        self._results[reqId].append(cd)
+        self._results[reqId].append(contractDetails)
 
     bondContractDetails = contractDetails
 
-    @iswrapper
     def contractDetailsEnd(self, reqId):
         self._endReq(reqId)
 
-    @iswrapper
     def symbolSamples(self, reqId, contractDescriptions):
-        cds = [ContractDescription(
-                **cd.__dict__) for cd in contractDescriptions]
-        for cd in cds:
-            cd.contract = Contract(**cd.contract.__dict__)
-        self._endReq(reqId, cds)
+        self._endReq(reqId, contractDescriptions)
 
-    @iswrapper
-    def realtimeBar(self, reqId, time, open_, high, low, close, volume,
-            wap, count):
+    def marketRule(self, marketRuleId, priceIncrements):
+        result = [
+            PriceIncrement(pi.lowEdge, pi.increment)
+            for pi in priceIncrements]
+        self._endReq(f'marketRule-{marketRuleId}', result)
+
+    def realtimeBar(
+            self, reqId, time, open_, high, low, close, volume, wap, count):
         dt = datetime.datetime.fromtimestamp(time, datetime.timezone.utc)
         bar = RealTimeBar(dt, -1, open_, high, low, close, volume, wap, count)
-        bars = self.reqId2Bars[reqId]
-        bars.append(bar)
-        self.handleEvent('barUpdateEvent', bars, True)
-        bars.updateEvent(bars, True)
+        bars = self.reqId2Subscriber.get(reqId)
+        if bars is not None:
+            bars.append(bar)
+            self.ib.barUpdateEvent.emit(bars, True)
+            bars.updateEvent.emit(bars, True)
 
-    @iswrapper
-    def historicalData(self, reqId , bar):
-        bar = BarData(**bar.__dict__)
+    def historicalData(self, reqId, bar):
         bar.date = util.parseIBDatetime(bar.date)
         self._results[reqId].append(bar)
 
-    @iswrapper
     def historicalDataEnd(self, reqId, _start, _end):
         self._endReq(reqId)
 
-    @iswrapper
     def historicalDataUpdate(self, reqId, bar):
-        bar = BarData(**bar.__dict__)
-        bars = self.reqId2Bars.get(reqId)
+        bars = self.reqId2Subscriber.get(reqId)
         if not bars:
             return
         bar.date = util.parseIBDatetime(bar.date)
@@ -480,10 +471,9 @@ class Wrapper(EWrapper):
             bars[-1] = bar
         else:
             return
-        self.handleEvent('barUpdateEvent', bars, hasNewBar)
-        bars.updateEvent(bars, hasNewBar)
+        self.ib.barUpdateEvent.emit(bars, hasNewBar)
+        bars.updateEvent.emit(bars, hasNewBar)
 
-    @iswrapper
     def headTimestamp(self, reqId, headTimestamp):
         try:
             dt = util.parseIBDatetime(headTimestamp)
@@ -491,42 +481,45 @@ class Wrapper(EWrapper):
         except ValueError as exc:
             self._endReq(reqId, exc, False)
 
-    @iswrapper
     def historicalTicks(self, reqId, ticks, done):
-        self._results[reqId] += [HistoricalTick(
+        self._results[reqId] += [
+            HistoricalTick(
                 datetime.datetime.fromtimestamp(t.time, datetime.timezone.utc),
-                t.price, t.size) for t in ticks if t.size]
+                t.price, t.size)
+            for t in ticks]
         if done:
             self._endReq(reqId)
 
-    @iswrapper
     def historicalTicksBidAsk(self, reqId, ticks, done):
-        self._results[reqId] += [HistoricalTickBidAsk(
+        self._results[reqId] += [
+            HistoricalTickBidAsk(
                 datetime.datetime.fromtimestamp(t.time, datetime.timezone.utc),
-                t.mask, t.priceBid, t.priceAsk, t.sizeBid, t.sizeAsk)
-                for t in ticks]
+                t.tickAttribBidAsk,
+                t.priceBid, t.priceAsk, t.sizeBid, t.sizeAsk)
+            for t in ticks]
         if done:
             self._endReq(reqId)
 
-    @iswrapper
     def historicalTicksLast(self, reqId, ticks, done):
-        self._results[reqId] += [HistoricalTickLast(
+        self._results[reqId] += [
+            HistoricalTickLast(
                 datetime.datetime.fromtimestamp(t.time, datetime.timezone.utc),
-                t.mask, t.price, t.size, t.exchange, t.specialConditions)
-                for t in ticks if t.size]
+                t.tickAttribLast,
+                t.price, t.size, t.exchange, t.specialConditions)
+            for t in ticks if t.size]
         if done:
             self._endReq(reqId)
 
-    @iswrapper
     # additional wrapper method provided by Client
     def priceSizeTick(self, reqId, tickType, price, size):
         ticker = self.reqId2Ticker.get(reqId)
         if not ticker:
             self._logger.error(f'priceSizeTick: Unknown reqId: {reqId}')
             return
-        ticker.time = self.lastTime
         # https://interactivebrokers.github.io/tws-api/tick_types.html
         if tickType in (1, 66):
+            if price == ticker.bid and size == ticker.bidSize:
+                return
             if price != ticker.bid:
                 ticker.prevBid = ticker.bid
                 ticker.bid = price
@@ -534,6 +527,8 @@ class Wrapper(EWrapper):
                 ticker.prevBidSize = ticker.bidSize
                 ticker.bidSize = size
         elif tickType in (2, 67):
+            if price == ticker.ask and size == ticker.askSize:
+                return
             if price != ticker.ask:
                 ticker.prevAsk = ticker.ask
                 ticker.ask = price
@@ -567,6 +562,10 @@ class Wrapper(EWrapper):
             ticker.low52week = price
         elif tickType == 20:
             ticker.high52week = price
+        elif tickType == 35:
+            ticker.auctionPrice = price
+        elif tickType == 37:
+            ticker.markPrice = price
         elif tickType == 50:
             ticker.bidYield = price
         elif tickType == 51:
@@ -578,25 +577,25 @@ class Wrapper(EWrapper):
             ticker.ticks.append(tick)
             self.pendingTickers.add(ticker)
 
-    @iswrapper
     def tickSize(self, reqId, tickType, size):
         ticker = self.reqId2Ticker.get(reqId)
         if not ticker:
             self._logger.error(f'tickSize: Unknown reqId: {reqId}')
             return
-        ticker.time = self.lastTime
         price = -1.0
         # https://interactivebrokers.github.io/tws-api/tick_types.html
         if tickType in (0, 69):
+            if size == ticker.bidSize:
+                return
             price = ticker.bid
-            if size != ticker.bidSize:
-                ticker.prevBidSize = ticker.bidSize
-                ticker.bidSize = size
+            ticker.prevBidSize = ticker.bidSize
+            ticker.bidSize = size
         elif tickType in (3, 70):
+            if size == ticker.askSize:
+                return
             price = ticker.ask
-            if size != ticker.askSize:
-                ticker.prevAskSize = ticker.askSize
-                ticker.askSize = size
+            ticker.prevAskSize = ticker.askSize
+            ticker.askSize = size
         elif tickType in (5, 71):
             price = ticker.last
             if util.isNan(price):
@@ -616,42 +615,68 @@ class Wrapper(EWrapper):
             ticker.callVolume = size
         elif tickType == 30:
             ticker.putVolume = size
+        elif tickType == 34:
+            ticker.auctionVolume = size
+        elif tickType == 36:
+            ticker.auctionImbalance = size
+        elif tickType == 86:
+            ticker.futuresOpenInterest = size
+        elif tickType == 87:
+            ticker.avOptionVolume = size
+        elif tickType == 89:
+            ticker.shortableShares = size
         if price or size:
             tick = TickData(self.lastTime, tickType, price, size)
             ticker.ticks.append(tick)
             self.pendingTickers.add(ticker)
 
-    @iswrapper
     def tickSnapshotEnd(self, reqId):
         self._endReq(reqId)
 
-    @iswrapper
-    def tickByTickAllLast(self, reqId, tickType, time, price, size,
-            attribs, exchange, specialConditions):
+    def tickByTickAllLast(
+            self, reqId, tickType, time, price, size, tickAttribLast,
+            exchange, specialConditions):
         ticker = self.reqId2Ticker.get(reqId)
         if not ticker:
             self._logger.error(f'tickByTickAllLast: Unknown reqId: {reqId}')
             return
-        attribs = TickAttrib(**attribs.__dict__)
-        tick = TickByTickAllLast(tickType, self.lastTime, price, size,
-                attribs, exchange, specialConditions)
+        if price != ticker.last:
+            ticker.prevLast = ticker.last
+            ticker.last = price
+        if size != ticker.lastSize:
+            ticker.prevLastSize = ticker.lastSize
+            ticker.lastSize = size
+        tick = TickByTickAllLast(
+            tickType, self.lastTime, price, size, tickAttribLast,
+            exchange, specialConditions)
         ticker.tickByTicks.append(tick)
         self.pendingTickers.add(ticker)
 
-    @iswrapper
-    def tickByTickBidAsk(self, reqId, time, bidPrice, askPrice,
-             bidSize, askSize, attribs):
+    def tickByTickBidAsk(
+            self, reqId, time, bidPrice, askPrice, bidSize, askSize,
+            tickAttribBidAsk):
         ticker = self.reqId2Ticker.get(reqId)
         if not ticker:
             self._logger.error(f'tickByTickBidAsk: Unknown reqId: {reqId}')
             return
-        attribs = TickAttrib(**attribs.__dict__)
-        tick = TickByTickBidAsk(self.lastTime, bidPrice, askPrice,
-                bidSize, askSize, attribs)
+        if bidPrice != ticker.bid:
+            ticker.prevBid = ticker.bid
+            ticker.bid = bidPrice
+        if bidSize != ticker.bidSize:
+            ticker.prevBidSize = ticker.bidSize
+            ticker.bidSize = bidSize
+        if askPrice != ticker.ask:
+            ticker.prevAsk = ticker.ask
+            ticker.ask = askPrice
+        if askSize != ticker.askSize:
+            ticker.prevAskSize = ticker.askSize
+            ticker.askSize = askSize
+        tick = TickByTickBidAsk(
+            self.lastTime, bidPrice, askPrice, bidSize, askSize,
+            tickAttribBidAsk)
         ticker.tickByTicks.append(tick)
         self.pendingTickers.add(ticker)
 
-    @iswrapper
     def tickByTickMidPoint(self, reqId, time, midPoint):
         ticker = self.reqId2Ticker.get(reqId)
         if not ticker:
@@ -660,21 +685,33 @@ class Wrapper(EWrapper):
         tick = TickByTickMidPoint(self.lastTime, midPoint)
         ticker.tickByTicks.append(tick)
         self.pendingTickers.add(ticker)
-    
-    @iswrapper
+
     def tickString(self, reqId, tickType, value):
         ticker = self.reqId2Ticker.get(reqId)
         if not ticker:
             return
         try:
-            if tickType == 48:
-            # RTVolume string format:
-            # price;size;time in ms since epoch;total volume;VWAP;single trade
-            # example:
-            # 701.28;1;1348075471534;67854;701.46918464;true
-                price, size, _, rtVolume, vwap, _ = value.split(';')
-                if rtVolume:
-                    ticker.rtVolume = int(rtVolume)
+            if tickType == 47:
+                # https://interactivebrokers.github.io/tws-api/fundamental_ratios_tags.html
+                d = dict(t.split('=') for t in value.split(';') if t)
+                for k, v in d.items():
+                    with suppress(ValueError):
+                        if v == '-99999.99':
+                            v = 'nan'
+                        d[k] = float(v)
+                        d[k] = int(v)
+                ticker.fundamentalRatios = FundamentalRatios(**d)
+            elif tickType in (48, 77):
+                # RT Volume or RT Trade Volume string format:
+                # price;size;ms since epoch;total volume;VWAP;single trade
+                # example:
+                # 701.28;1;1348075471534;67854;701.46918464;true
+                price, size, _, volume, vwap, _ = value.split(';')
+                if volume:
+                    if tickType == 48:
+                        ticker.rtVolume = int(volume)
+                    elif tickType == 77:
+                        ticker.rtTradeVolume = int(volume)
                 if vwap:
                     ticker.vwap = float(vwap)
                 if price == '':
@@ -682,80 +719,121 @@ class Wrapper(EWrapper):
                 price = float(price)
                 size = float(size)
                 if price and size:
-                    ticker.prevLast = ticker.last
-                    ticker.prevLastSize = ticker.lastSize
-                    ticker.last = price
-                    ticker.lastSize = size
+                    if ticker.prevLast != ticker.last:
+                        ticker.prevLast = ticker.last
+                        ticker.last = price
+                    if ticker.prevLastSize != ticker.lastSize:
+                        ticker.prevLastSize = ticker.lastSize
+                        ticker.lastSize = size
                     tick = TickData(self.lastTime, tickType, price, size)
                     ticker.ticks.append(tick)
                     self.pendingTickers.add(ticker)
             elif tickType == 59:
+                # Dividend tick:
                 # https://interactivebrokers.github.io/tws-api/tick_types.html#ib_dividends
-                # dividend example:
-                # 0.83,0.92,20130219,0.23
-                past12, next12, date, amount = value.split(',')
-                ticker.dividends = Dividends(float(past12), float(next12),
-                        util.parseIBDatetime(date), float(amount))
+                # example value: '0.83,0.92,20130219,0.23'
+                past12, next12, nextDate, nextAmount = value.split(',')
+                ticker.dividends = Dividends(
+                    float(past12) if past12 else None,
+                    float(next12) if next12 else None,
+                    util.parseIBDatetime(nextDate) if nextDate else None,
+                    float(nextAmount) if nextAmount else None)
+            elif tickType == 77:
+                # RT Trade Volume
+                # price;size;ms since epoch;total volume;VWAP;single trade
+                # example value: '90.31;1;1568407233444;19015;90.07778509;true'
+                price, size, _, rtTradeVolume, vwap, _ = value.split(';')
+                if rtTradeVolume:
+                    ticker.rtTradeVolume = int(rtTradeVolume)
+                if vwap:
+                    ticker.vwap = float(vwap)
+                if price == '':
+                    return
+                price = float(price)
+                size = float(size)
+                if price and size:
+                    if ticker.prevLast != ticker.last:
+                        ticker.prevLast = ticker.last
+                        ticker.last = price
+                    if ticker.prevLastSize != ticker.lastSize:
+                        ticker.prevLastSize = ticker.lastSize
+                        ticker.lastSize = size
+                    tick = TickData(self.lastTime, tickType, price, size)
+                    ticker.ticks.append(tick)
+                    self.pendingTickers.add(ticker)
         except ValueError:
-            self._logger.error(f'tickString with tickType {tickType}: '
-                    f'malformed value: {value!r}')
+            self._logger.error(
+                f'tickString with tickType {tickType}: '
+                f'malformed value: {value!r}')
 
-    @iswrapper
     def tickGeneric(self, reqId, tickType, value):
         ticker = self.reqId2Ticker.get(reqId)
         if not ticker:
             return
         try:
             value = float(value)
-            tick = TickData(self.lastTime, tickType, value, 0)
-            ticker.ticks.append(tick)
-            self.pendingTickers.add(ticker)
         except ValueError:
             self._logger.error(f'genericTick: malformed value: {value!r}')
-            
-    @iswrapper
+            return
+        if tickType == 23:
+            ticker.histVolatility = value
+        elif tickType == 24:
+            ticker.impliedVolatility = value
+        elif tickType == 31:
+            ticker.indexFuturePremium = value
+        elif tickType == 49:
+            ticker.halted = value
+        elif tickType == 54:
+            ticker.tradeCount = value
+        elif tickType == 55:
+            ticker.tradeRate = value
+        elif tickType == 56:
+            ticker.volumeRate = value
+        elif tickType == 58:
+            ticker.rtHistVolatility = value
+        tick = TickData(self.lastTime, tickType, value, 0)
+        ticker.ticks.append(tick)
+        self.pendingTickers.add(ticker)
+
     def tickReqParams(self, reqId, minTick, bboExchange, snapshotPermissions):
         pass
-        
-    @iswrapper
+
     def mktDepthExchanges(self, depthMktDataDescriptions):
-        result = [DepthMktDataDescription(**d.__dict__)
-                for d in depthMktDataDescriptions]
-        self._endReq('mktDepthExchanges', result)
+        self._endReq('mktDepthExchanges', depthMktDataDescriptions)
 
-    @iswrapper
     def updateMktDepth(self, reqId, position, operation, side, price, size):
-        self.updateMktDepthL2(reqId, position, '', operation, side, price, size)
+        self.updateMktDepthL2(
+            reqId, position, '', operation, side, price, size)
 
-    @iswrapper
-    def updateMktDepthL2(self, reqId, position, marketMaker, operation,
-            side, price, size):
+    def updateMktDepthL2(
+            self, reqId, position, marketMaker, operation,
+            side, price, size, isSmartDepth=False):
         # operation: 0 = insert, 1 = update, 2 = delete
         # side: 0 = ask, 1 = bid
         ticker = self.reqId2Ticker[reqId]
-        ticker.time = self.lastTime
 
-        l = ticker.domBids if side else ticker.domAsks
+        dom = ticker.domBids if side else ticker.domAsks
         if operation == 0:
-            l.insert(position, DOMLevel(price, size, marketMaker))
+            dom.insert(position, DOMLevel(price, size, marketMaker))
         elif operation == 1:
-            l[position] = DOMLevel(price, size, marketMaker)
+            dom[position] = DOMLevel(price, size, marketMaker)
         elif operation == 2:
-            if position < len(l):
-                level = l.pop(position)
+            if position < len(dom):
+                level = dom.pop(position)
                 price = level.price
                 size = 0
 
-        tick = MktDepthData(self.lastTime, position, marketMaker,
-                operation, side, price, size)
+        tick = MktDepthData(
+            self.lastTime, position, marketMaker, operation, side, price, size)
         ticker.domTicks.append(tick)
         self.pendingTickers.add(ticker)
 
-    @iswrapper
-    def tickOptionComputation(self, reqId, tickType, impliedVol,
-            delta, optPrice, pvDividend, gamma, vega, theta, undPrice):
-        comp = OptionComputation(impliedVol,
-                delta, optPrice, pvDividend, gamma, vega, theta, undPrice)
+    def tickOptionComputation(
+            self, reqId, tickType, impliedVol, delta, optPrice, pvDividend,
+            gamma, vega, theta, undPrice):
+        comp = OptionComputation(
+            impliedVol, delta, optPrice, pvDividend,
+            gamma, vega, theta, undPrice)
         ticker = self.reqId2Ticker.get(reqId)
         if ticker:
             # reply from reqMktData
@@ -772,88 +850,103 @@ class Wrapper(EWrapper):
             # reply from calculateImpliedVolatility or calculateOptionPrice
             self._endReq(reqId, comp)
         else:
-            self._logger.error(f'tickOptionComputation: Unknown reqId: {reqId}')
+            self._logger.error(
+                f'tickOptionComputation: Unknown reqId: {reqId}')
 
-    @iswrapper
     def fundamentalData(self, reqId, data):
         self._endReq(reqId, data)
 
-    @iswrapper
     def scannerParameters(self, xml):
         self._endReq('scannerParams', xml)
 
-    @iswrapper
-    def scannerData(self, reqId, rank, contractDetails, distance,
-            benchmark, projection, legsStr):
-        cd = ContractDetails(**contractDetails.__dict__)
-        if cd.summary:
-            cd.summary = Contract(**cd.summary.__dict__)
-        data = ScanData(rank, cd, distance, benchmark, projection, legsStr)
-        self._results[reqId].append(data)
+    def scannerData(
+            self, reqId, rank, contractDetails, distance, benchmark,
+            projection, legsStr):
+        data = ScanData(
+            rank, contractDetails, distance, benchmark, projection, legsStr)
+        dataList = self.reqId2Subscriber.get(reqId)
+        if dataList is None:
+            dataList = self._results.get(reqId)
+        if dataList is not None:
+            if rank == 0:
+                dataList.clear()
+            dataList.append(data)
 
-    @iswrapper
     def scannerDataEnd(self, reqId):
-        self._endReq(reqId)
+        dataList = self._results.get(reqId)
+        if dataList is not None:
+            self._endReq(reqId)
+        else:
+            dataList = self.reqId2Subscriber.get(reqId)
+        if dataList is not None:
+            self.ib.scannerDataEvent.emit(dataList)
+            dataList.updateEvent.emit(dataList)
 
-    @iswrapper
     def histogramData(self, reqId, items):
         result = [HistogramData(item.price, item.count) for item in items]
         self._endReq(reqId, result)
 
-    @iswrapper
-    def securityDefinitionOptionParameter(self, reqId, exchange,
-            underlyingConId, tradingClass, multiplier, expirations, strikes):
-        chain = OptionChain(exchange, underlyingConId,
-                tradingClass, multiplier, expirations, strikes)
+    def securityDefinitionOptionParameter(
+            self, reqId, exchange, underlyingConId, tradingClass,
+            multiplier, expirations, strikes):
+        chain = OptionChain(
+            exchange, underlyingConId, tradingClass, multiplier,
+            expirations, strikes)
         self._results[reqId].append(chain)
 
-    @iswrapper
     def securityDefinitionOptionParameterEnd(self, reqId):
         self._endReq(reqId)
 
-    @iswrapper
     def newsProviders(self, newsProviders):
-        newsProviders = [NewsProvider(code=p.code, name=p.name)
-                for p in newsProviders]
+        newsProviders = [
+            NewsProvider(code=p.code, name=p.name)
+            for p in newsProviders]
         self._endReq('newsProviders', newsProviders)
 
-    @iswrapper
-    def tickNews(self, _reqId, timeStamp, providerCode, articleId,
+    def tickNews(
+            self, _reqId, timeStamp, providerCode, articleId,
             headline, extraData):
-        news = NewsTick(timeStamp, providerCode, articleId, headline, extraData)
+        news = NewsTick(
+            timeStamp, providerCode, articleId, headline, extraData)
         self.newsTicks.append(news)
-        self.handleEvent('tickNewsEvent', news)
+        self.ib.tickNewsEvent.emit(news)
 
-    @iswrapper
     def newsArticle(self, reqId, articleType, articleText):
         article = NewsArticle(articleType, articleText)
         self._endReq(reqId, article)
 
-    @iswrapper
     def historicalNews(self, reqId, time, providerCode, articleId, headline):
         article = HistoricalNews(time, providerCode, articleId, headline)
         self._results[reqId].append(article)
 
-    @iswrapper
     def historicalNewsEnd(self, reqId, _hasMore):
         self._endReq(reqId)
 
-    @iswrapper
     def updateNewsBulletin(self, msgId, msgType, message, origExchange):
         bulletin = NewsBulletin(msgId, msgType, message, origExchange)
         self.newsBulletins[msgId] = bulletin
+        self.ib.newsBulletinEvent.emit(bulletin)
 
-    @iswrapper
     def receiveFA(self, _faDataType, faXmlData):
         self._endReq('requestFA', faXmlData)
 
-    @iswrapper
+    def currentTime(self, time):
+        dt = datetime.datetime.fromtimestamp(time, datetime.timezone.utc)
+        self._endReq('currentTime', dt)
+
+    def tickEFP(
+            self, reqId, tickType, basisPoints, formattedBasisPoints,
+            totalDividends, holdDays, futureLastTradeDate, dividendImpact,
+            dividendsToLastTradeDate):
+        pass
+
     def error(self, reqId, errorCode, errorString):
         # https://interactivebrokers.github.io/tws-api/message_codes.html
         warningCodes = {165, 202, 399, 434, 10167}
         isWarning = errorCode in warningCodes or 2100 <= errorCode < 2200
-        msg = (f'{"Warning" if isWarning else "Error"} '
-                f'{errorCode}, reqId {reqId}: {errorString}')
+        msg = (
+            f'{"Warning" if isWarning else "Error"} '
+            f'{errorCode}, reqId {reqId}: {errorString}')
         contract = self._reqId2Contract.get(reqId)
         if contract:
             msg += f', contract: {contract}'
@@ -873,46 +966,34 @@ class Wrapper(EWrapper):
                     logEntry = TradeLogEntry(self.lastTime, status, msg)
                     trade.log.append(logEntry)
                     self._logger.warning(f'Canceled order: {trade}')
-                    self.handleEvent('orderStatusEvent', trade)
-                    self.trade.canceledEvent.emit(trade)
+                    self.ib.orderStatusEvent.emit(trade)
+                    trade.cancelledEvent.emit(trade)
             elif errorCode == 317:
                 # Market depth data has been RESET
                 ticker = self.reqId2Ticker.get(reqId)
                 if ticker:
                     for side, l in ((0, ticker.domAsks), (1, ticker.domBids)):
-                        for position in reversed(range(l)):
+                        for position in reversed(l):
                             level = l.pop(position)
-                            tick = MktDepthData(self.lastTime, position,
-                                    '', 2, side, level.price, 0)
+                            tick = MktDepthData(
+                                self.lastTime, position, '', 2,
+                                side, level.price, 0)
                             ticker.domTicks.append(tick)
 
-        self.handleEvent('errorEvent', reqId, errorCode, errorString, contract)
+        self.ib.errorEvent.emit(reqId, errorCode, errorString, contract)
 
-    @iswrapper
-    # additional wrapper method provided by Client
     def tcpDataArrived(self):
         self.lastTime = datetime.datetime.now(datetime.timezone.utc)
-        if self.autoclearTickers:
-            self.clearPendingTickers()
-
-    @iswrapper
-    # additional wrapper method provided by Client
-    def tcpDataProcessed(self):
-        if self.pendingTickers:
-            self.handleEvent('pendingTickersEvent', list(self.pendingTickers))
-            for ticker in (t for t in self.pendingTickers
-                    if t.updateEvent.slots):
-                ticker.updateEvent.emit(ticker)
-        self.updateEv.set()
-        self.updateEv.clear()
-        self.handleEvent('updateEvent')
-
-    def clearPendingTickers(self):
-        """
-        Clear pending tickers and their ticks
-        """
         for ticker in self.pendingTickers:
-            del ticker.ticks[:]
-            del ticker.tickByTicks[:]
-            del ticker.domTicks[:]
-        self.pendingTickers.clear()
+            ticker.ticks = []
+            ticker.tickByTicks = []
+            ticker.domTicks = []
+        self.pendingTickers = set()
+
+    def tcpDataProcessed(self):
+        self.ib.updateEvent.emit()
+        if self.pendingTickers:
+            for ticker in self.pendingTickers:
+                ticker.time = self.lastTime
+                ticker.updateEvent.emit(ticker)
+            self.ib.pendingTickersEvent.emit(self.pendingTickers)
