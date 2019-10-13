@@ -1,38 +1,25 @@
 from collections import namedtuple
 
-import ibapi.scanner
-import ibapi.contract
-import ibapi.common
-import ibapi.order
-import ibapi.order_state
-import ibapi.softdollartier
-import ibapi.execution
-import ibapi.commission_report
+from .util import UNSET_DOUBLE, UNSET_INTEGER
 
-# order conditions are imported as-is from ibapi
-from ibapi.order_condition import (OrderCondition, ExecutionCondition,
-        OperatorCondition, MarginCondition, ContractCondition, TimeCondition,
-        PriceCondition, PercentChangeCondition, VolumeCondition)
-
-from ib_insync.event import Event
+from eventkit import Event
 
 __all__ = (
     'Object ContractDetails ContractDescription '
-    'ComboLeg UnderComp DeltaNeutralContract OrderComboLeg OrderState '
-    'ScannerSubscription SoftDollarTier '
-    'Execution CommissionReport ExecutionFilter '
+    'ComboLeg DeltaNeutralContract OrderComboLeg OrderState '
+    'SoftDollarTier PriceIncrement Execution CommissionReport '
     'BarList BarDataList RealTimeBarList BarData RealTimeBar '
-    'HistogramData TickAttrib NewsProvider DepthMktDataDescription '
-    'PnL PnLSingle AccountValue RealTimeBar TickData '
+    'HistogramData NewsProvider DepthMktDataDescription '
+    'ScannerSubscription ScanData ScanDataList FundamentalRatios '
+    'ExecutionFilter PnL PnLSingle AccountValue TickData '
     'TickByTickAllLast TickByTickBidAsk TickByTickMidPoint '
     'HistoricalTick HistoricalTickBidAsk HistoricalTickLast '
-    'MktDepthData DOMLevel BracketOrder TradeLogEntry ScanData TagValue '
+    'TickAttrib TickAttribBidAsk TickAttribLast '
+    'MktDepthData DOMLevel BracketOrder TradeLogEntry TagValue '
+    'FamilyCode SmartComponent '
     'PortfolioItem Position Fill OptionComputation OptionChain Dividends '
-    'NewsArticle HistoricalNews NewsTick NewsBulletin ConnectionStats '
-    'OrderCondition ExecutionCondition OperatorCondition MarginCondition '
-    'ContractCondition TimeCondition PriceCondition PercentChangeCondition '
-    'VolumeCondition'
-    ).split()
+    'NewsArticle HistoricalNews NewsTick NewsBulletin ConnectionStats'
+).split()
 
 nan = float('nan')
 
@@ -40,14 +27,14 @@ nan = float('nan')
 class Object:
     """
     Base object, with:
-    
+
     * __slots__ to avoid typos;
     * A general constructor;
     * A general string representation;
     * A default equality testing that compares attributes.
     """
-    __slots__ = ()
-    defaults = {}
+    __slots__ = ('__weakref__',)
+    defaults: dict = {}
 
     def __init__(self, *args, **kwargs):
         """
@@ -62,7 +49,7 @@ class Object:
             setattr(self, k, v)
 
     def __repr__(self):
-        clsName = self.__class__.__name__
+        clsName = self.__class__.__qualname__
         kwargs = ', '.join(f'{k}={v!r}' for k, v in self.nonDefaults().items())
         return f'{clsName}({kwargs})'
 
@@ -97,10 +84,10 @@ class Object:
         """
         diff = {}
         for k in self.__class__.defaults:
-            l = getattr(self, k)
-            r = getattr(other, k)
-            if l != r:
-                diff[k] = (l, r)
+            left = getattr(self, k)
+            right = getattr(other, k)
+            if left != right:
+                diff[k] = (left, right)
         return diff
 
     def nonDefaults(self):
@@ -127,105 +114,258 @@ class DynamicObject:
 
 
 class ContractDetails(Object):
-    defaults = ibapi.contract.ContractDetails().__dict__
-    defaults['summary'] = None
-    defaults.pop('contract', None)
-    __slots__ = list(defaults.keys()) + \
-            ['secIdListCount']  # bug in ibapi decoder
-
-    # summary is renamed to contract in ibapi v9.73.07
-    @property
-    def contract(self):
-        return self.summary
-
-    @contract.setter
-    def contract(self, c):
-        self.summary = c
+    defaults = dict(
+        contract=None,
+        marketName='',
+        minTick=0.0,
+        orderTypes='',
+        validExchanges='',
+        priceMagnifier=0,
+        underConId=0,
+        longName='',
+        contractMonth='',
+        industry='',
+        category='',
+        subcategory='',
+        timeZoneId='',
+        tradingHours='',
+        liquidHours='',
+        evRule='',
+        evMultiplier=0,
+        mdSizeMultiplier=0,
+        aggGroup=0,
+        underSymbol='',
+        underSecType='',
+        marketRuleIds='',
+        secIdList=None,
+        realExpirationDate='',
+        lastTradeTime='',
+        stockType='',
+        cusip='',
+        ratings='',
+        descAppend='',
+        bondType='',
+        couponType='',
+        callable=False,
+        putable=False,
+        coupon=0,
+        convertible=False,
+        maturity='',
+        issueDate='',
+        nextOptionDate='',
+        nextOptionType='',
+        nextOptionPartial=False,
+        notes='')
+    __slots__ = defaults.keys()
 
 
 class ContractDescription(Object):
-    defaults = ibapi.contract.ContractDescription().__dict__
-    defaults['contract'] = None
+    defaults = dict(
+        contract=None,
+        derivativeSecTypes=None
+    )
     __slots__ = defaults.keys()
 
 
 class ComboLeg(Object):
-    defaults = ibapi.contract.ComboLeg().__dict__
-    __slots__ = defaults.keys()
-
-
-class UnderComp(Object):
     defaults = dict(
-       conId=0,
-       delta=0.0,
-       price=0.0)
+        conId=0,
+        ratio=0,
+        action='',
+        exchange='',
+        openClose=0,
+        shortSaleSlot=0,
+        designatedLocation='',
+        exemptCode=-1)
     __slots__ = defaults.keys()
-# UnderComp is renamed to DeltaNeutralContract in ibapi v9.73.07
-DeltaNeutralContract = UnderComp
+
+
+class DeltaNeutralContract(Object):
+    defaults = dict(
+        conId=0,
+        delta=0.0,
+        price=0.0)
+    __slots__ = defaults.keys()
 
 
 class OrderComboLeg(Object):
-    defaults = ibapi.order.OrderComboLeg().__dict__
+    defaults = dict(
+        price=UNSET_DOUBLE)
     __slots__ = defaults.keys()
 
 
 class OrderState(Object):
-    defaults = ibapi.order_state.OrderState().__dict__
+    defaults = dict(
+        status='',
+        initMarginBefore='',
+        maintMarginBefore='',
+        equityWithLoanBefore='',
+        initMarginChange='',
+        maintMarginChange='',
+        equityWithLoanChange='',
+        initMarginAfter='',
+        maintMarginAfter='',
+        equityWithLoanAfter='',
+        commission=UNSET_DOUBLE,
+        minCommission=UNSET_DOUBLE,
+        maxCommission=UNSET_DOUBLE,
+        commissionCurrency='',
+        warningText='',
+        completedTime='',
+        completedStatus='')
     __slots__ = defaults.keys()
 
 
 class ScannerSubscription(Object):
-    defaults = ibapi.scanner.ScannerSubscription().__dict__
+    defaults = dict(
+        numberOfRows=-1,
+        instrument='',
+        locationCode='',
+        scanCode='',
+        abovePrice=UNSET_DOUBLE,
+        belowPrice=UNSET_DOUBLE,
+        aboveVolume=UNSET_INTEGER,
+        marketCapAbove=UNSET_DOUBLE,
+        marketCapBelow=UNSET_DOUBLE,
+        moodyRatingAbove='',
+        moodyRatingBelow='',
+        spRatingAbove='',
+        spRatingBelow='',
+        maturityDateAbove='',
+        maturityDateBelow='',
+        couponRateAbove=UNSET_DOUBLE,
+        couponRateBelow=UNSET_DOUBLE,
+        excludeConvertible=False,
+        averageOptionVolumeAbove=UNSET_INTEGER,
+        scannerSettingPairs='',
+        stockTypeFilter='')
     __slots__ = defaults.keys()
 
 
 class SoftDollarTier(Object):
-    defaults = ibapi.softdollartier.SoftDollarTier().__dict__
+    defaults = dict(
+        name='',
+        val='',
+        displayName='')
     __slots__ = defaults.keys()
 
 
 class Execution(Object):
-    defaults = ibapi.execution.Execution().__dict__
+    defaults = dict(
+        execId='',
+        time='',
+        acctNumber='',
+        exchange='',
+        side='',
+        shares=0.0,
+        price=0.0,
+        permId=0,
+        clientId=0,
+        orderId=0,
+        liquidation=0,
+        cumQty=0.0,
+        avgPrice=0.0,
+        orderRef='',
+        evRule='',
+        evMultiplier=0.0,
+        modelCode='',
+        lastLiquidity=0)
     __slots__ = defaults.keys()
 
 
 class CommissionReport(Object):
-    defaults = ibapi.commission_report.CommissionReport().__dict__
+    defaults = dict(
+        execId='',
+        commission=0.0,
+        currency='',
+        realizedPNL=0.0,
+        yield_=0.0,
+        yieldRedemptionDate=0)
     __slots__ = defaults.keys()
 
 
 class ExecutionFilter(Object):
-    defaults = ibapi.execution.ExecutionFilter().__dict__
+    defaults = dict(
+        clientId=0,
+        acctCode='',
+        time='',
+        symbol='',
+        secType='',
+        exchange='',
+        side='')
     __slots__ = defaults.keys()
 
 
 class BarData(Object):
-    defaults = ibapi.common.BarData().__dict__
+    defaults = dict(
+        date='',
+        open=0.0,
+        high=0.0,
+        low=0.0,
+        close=0.0,
+        volume=0,
+        average=0.0,
+        barCount=0)
     __slots__ = defaults.keys()
 
 
 class RealTimeBar(Object):
-    defaults = ibapi.common.RealTimeBar().__dict__
+    defaults = dict(
+        time=0,
+        endTime=-1,
+        open_=0.0,
+        high=0.0,
+        low=0.0,
+        close=0.0,
+        volume=0.0,
+        wap=0.0,
+        count=0)
     __slots__ = defaults.keys()
 
 
 class TickAttrib(Object):
-    defaults = ibapi.common.TickAttrib().__dict__
+    defaults = dict(
+        canAutoExecute=False,
+        pastLimit=False,
+        preOpen=False)
+    __slots__ = defaults.keys()
+
+
+class TickAttribBidAsk(Object):
+    defaults = dict(
+        bidPastLow=False,
+        askPastHigh=False)
+    __slots__ = defaults.keys()
+
+
+class TickAttribLast(Object):
+    defaults = dict(
+        pastLimit=False,
+        unreported=False)
     __slots__ = defaults.keys()
 
 
 class HistogramData(Object):
-    defaults = ibapi.common.HistogramData().__dict__
+    defaults = dict(
+        price=0.0,
+        count=0)
     __slots__ = defaults.keys()
 
 
 class NewsProvider(Object):
-    defaults = ibapi.common.NewsProvider().__dict__
+    defaults = dict(
+        code='',
+        name='')
     __slots__ = defaults.keys()
 
 
 class DepthMktDataDescription(Object):
-    defaults = ibapi.common.DepthMktDataDescription().__dict__
+    defaults = dict(
+        exchange='',
+        secType='',
+        listingExch='',
+        serviceDataType='',
+        aggGroup=UNSET_INTEGER)
     __slots__ = defaults.keys()
 
 
@@ -252,18 +392,24 @@ class PnLSingle(Object):
     __slots__ = defaults.keys()
 
 
+class FundamentalRatios(DynamicObject):
+    """
+    https://interactivebrokers.github.io/tws-api/fundamental_ratios_tags.html
+    """
+    pass
+
+
 class BarList(list):
     """
-    Events:
-        * ``updateEvent(bars, hasNewBar)``
+    Base class for bar lists.
     """
     events = ('updateEvent',)
-    
-    __slots__ = events
+
+    __slots__ = events + ('__weakref__',)
 
     def __init__(self, *args):
         list.__init__(self, *args)
-        Event.init(self, BarList.events)
+        self.updateEvent = Event('updateEvent')
 
     def __eq__(self, other):
         return self is other
@@ -273,88 +419,167 @@ class BarList(list):
 
 
 class BarDataList(BarList):
-    __slots__ = ('reqId', 'contract', 'endDateTime', 'durationStr',
-            'barSizeSetting', 'whatToShow', 'useRTH', 'formatDate',
-            'keepUpToDate', 'chartOptions')
+    """
+    List of :class:`.BarData` that also stores all request parameters.
+
+    Events:
+
+        * ``updateEvent``
+          (bars: :class:`.BarDataList`, hasNewBar: bool)
+    """
+    __slots__ = (
+        'reqId', 'contract', 'endDateTime', 'durationStr',
+        'barSizeSetting', 'whatToShow', 'useRTH', 'formatDate',
+        'keepUpToDate', 'chartOptions')
 
 
 class RealTimeBarList(BarList):
-    __slots__ = ('reqId', 'contract', 'barSize', 'whatToShow', 'useRTH',
-            'realTimeBarsOptions')
+    """
+    List of :class:`.RealTimeBar` that also stores all request parameters.
+
+    Events:
+
+        * ``updateEvent``
+          (bars: :class:`.RealTimeBarList`, hasNewBar: bool)
+    """
+    __slots__ = (
+        'reqId', 'contract', 'barSize', 'whatToShow', 'useRTH',
+        'realTimeBarsOptions')
 
 
-AccountValue = namedtuple('AccountValue',
-    'account tag value currency modelCode')
+class ScanDataList(list):
+    """
+    List of :class:`.ScanData` that also stores all request parameters.
 
-TickData = namedtuple('TickData',
-    'time tickType price size')
+    Events:
+        * ``updateEvent`` (:class:`.ScanDataList`)
+    """
+    events = ('updateEvent',)
 
-HistoricalTick = namedtuple('HistoricalTick',
-    'time price size')
+    __slots__ = events + (
+        'reqId', 'subscription', 'scannerSubscriptionOptions',
+        'scannerSubscriptionFilterOptions', '__weakref__')
 
-HistoricalTickBidAsk = namedtuple('HistoricalTickBidAsk',
-    'time mask priceBid priceAsk sizeBid sizeAsk')
+    def __init__(self, *args):
+        list.__init__(self, *args)
+        self.updateEvent = Event('updateEvent')
 
-HistoricalTickLast = namedtuple('HistoricalTickLast',
-    'time mask price size exchange specialConditions')
+    def __eq__(self, other):
+        return self is other
 
-TickByTickAllLast = namedtuple('TickByTickAllLast',
-    'tickType time price size attribs exchange specialConditions')
+    def __hash__(self):
+        return id(self)
 
-TickByTickBidAsk = namedtuple('TickByTickBidAsk',
-    'time bidPrice askPrice bidSize askSize attribs')
 
-TickByTickMidPoint = namedtuple('TickByTickMidPoint',
-    'time midPoint')
-
-MktDepthData = namedtuple('MktDepthData',
-    'time position marketMaker operation side price size')
-
-DOMLevel = namedtuple('DOMLevel',
-    'price size marketMaker')
-
-BracketOrder = namedtuple('BracketOrder',
-    'parent takeProfit stopLoss')
-
-TradeLogEntry = namedtuple('TradeLogEntry',
-    'time status message')
-
-ScanData = namedtuple('ScanData',
-    'rank contractDetails distance benchmark projection legsStr')
-
-TagValue = namedtuple('TagValue',
+TagValue = namedtuple(
+    'TagValue',
     'tag value')
 
-PortfolioItem = namedtuple('PortfolioItem', (
-    'contract position marketPrice marketValue averageCost '
-    'unrealizedPNL realizedPNL account'))
+AccountValue = namedtuple(
+    'AccountValue',
+    'account tag value currency modelCode')
 
-Position = namedtuple('Position',
+TickData = namedtuple(
+    'TickData',
+    'time tickType price size')
+
+HistoricalTick = namedtuple(
+    'HistoricalTick',
+    'time price size')
+
+HistoricalTickBidAsk = namedtuple(
+    'HistoricalTickBidAsk',
+    'time tickAttribBidAsk priceBid priceAsk sizeBid sizeAsk')
+
+HistoricalTickLast = namedtuple(
+    'HistoricalTickLast',
+    'time tickAttribLast price size exchange specialConditions')
+
+TickByTickAllLast = namedtuple(
+    'TickByTickAllLast',
+    'tickType time price size tickAttribLast exchange specialConditions')
+
+TickByTickBidAsk = namedtuple(
+    'TickByTickBidAsk',
+    'time bidPrice askPrice bidSize askSize tickAttribBidAsk')
+
+TickByTickMidPoint = namedtuple(
+    'TickByTickMidPoint',
+    'time midPoint')
+
+MktDepthData = namedtuple(
+    'MktDepthData',
+    'time position marketMaker operation side price size')
+
+DOMLevel = namedtuple(
+    'DOMLevel',
+    'price size marketMaker')
+
+BracketOrder = namedtuple(
+    'BracketOrder',
+    'parent takeProfit stopLoss')
+
+TradeLogEntry = namedtuple(
+    'TradeLogEntry',
+    'time status message')
+
+PriceIncrement = namedtuple(
+    'PriceIncrement',
+    'lowEdge increment')
+
+ScanData = namedtuple(
+    'ScanData',
+    'rank contractDetails distance benchmark projection legsStr')
+
+PortfolioItem = namedtuple(
+    'PortfolioItem',
+    'contract position marketPrice marketValue averageCost '
+    'unrealizedPNL realizedPNL account')
+
+Position = namedtuple(
+    'Position',
     'account contract position avgCost')
 
-Fill = namedtuple('Fill',
+Fill = namedtuple(
+    'Fill',
     'contract execution commissionReport time')
 
-OptionComputation = namedtuple('OptionComputation',
+OptionComputation = namedtuple(
+    'OptionComputation',
     'impliedVol delta optPrice pvDividend gamma vega theta undPrice')
 
-OptionChain = namedtuple('OptionChain',
+OptionChain = namedtuple(
+    'OptionChain',
     'exchange underlyingConId tradingClass multiplier expirations strikes')
 
-Dividends = namedtuple('Dividends',
+Dividends = namedtuple(
+    'Dividends',
     'past12Months next12Months nextDate nextAmount')
 
-NewsArticle = namedtuple('NewsArticle',
+NewsArticle = namedtuple(
+    'NewsArticle',
     'articleType articleText')
 
-HistoricalNews = namedtuple('HistoricalNews',
+HistoricalNews = namedtuple(
+    'HistoricalNews',
     'time providerCode articleId headline')
 
-NewsTick = namedtuple('NewsTick',
+NewsTick = namedtuple(
+    'NewsTick',
     'timeStamp providerCode articleId headline extraData')
 
-NewsBulletin = namedtuple('NewsBulletin',
+NewsBulletin = namedtuple(
+    'NewsBulletin',
     'msgId msgType message origExchange')
 
-ConnectionStats = namedtuple('ConnectionStats',
+FamilyCode = namedtuple(
+    'FamilyCode',
+    'accountID familyCodeStr')
+
+SmartComponent = namedtuple(
+    'SmartComponent',
+    'bitNumber exchange exchangeLetter')
+
+ConnectionStats = namedtuple(
+    'ConnectionStats',
     'startTime duration numBytesRecv numBytesSent numMsgRecv numMsgSent')
